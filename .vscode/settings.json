@@ -1,0 +1,8 @@
+{
+  "files.associations": {
+    "format": "cpp",
+    "cstdint": "cpp",
+    "utility": "cpp",
+    "string_view": "cpp"
+  }
+}
