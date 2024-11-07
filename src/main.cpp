@@ -1,106 +1,221 @@
+
 #include <Arduino.h>
 #include <FreeRTOS.h>
+#include <HADevice.h>
+#include <HAMQTT.h>
 #include <WiFi.h>
-#include <semphr.h>
+#include <device-types/HACover.h>
+#include <queue.H>
+#include <somfy_radio.h>
 #include <task.h>
-#include <timers.h>
 
-#include <array>
-#include <atomic>
-#include <cmath>
-#include <functional>
-#include <string_view>
-#include <utility>
+using namespace awning;
 
-WiFiClient client;
-
-#define SSTR(s) (#s)
-#define STR(s) SSTR(s)
-
-class PingPonger {
+class DebouncedButton {
  public:
-  void Begin(IPAddress addr) {
-    client.setSync(true);
-    if (!client.connect(addr, 51234)) {
-      Serial1.println("Failed to connect.");
-      configASSERT(false);
-    }
-
-    parent_task_ = xTaskGetCurrentTaskHandle();
-    xTaskCreate(
-        [](void* arg) {
-          // Run only on core 0. This may cause rescheduling.
-          vTaskCoreAffinitySet(xTaskGetCurrentTaskHandle(), 0b1);
-          reinterpret_cast<PingPonger*>(arg)->DoPingPong();
-        },
-        "PingPonger", 256, this, 1, nullptr);
-    xTaskNotifyWait(0, 0, nullptr, portMAX_DELAY);
-    Serial1.println("First ping pong done");
+  DebouncedButton(uint8_t pin, std::function<void()> handler)
+      : pin_(pin), handler_(handler) {
+    pinMode(pin_, INPUT_PULLUP);
+    attachInterruptParam(pin_, &DebouncedButton::Press, FALLING, this);
+    last_press_ = millis() - 5'000;
   }
 
-  void DoPingPong() {
-    while (true) {
-      client.write("ping", 4);
+  ~DebouncedButton() { detachInterrupt(pin_); }
 
-      uint8_t buf[4];
-      int recvd = 0;
+  static void Press(void* arg) {
+    auto& pin = *reinterpret_cast<DebouncedButton*>(arg);
+    const int32_t now = millis();
 
-      while (recvd < 4) {
-        recvd += client.read(&buf[recvd], 4 - recvd);
-      }
-
-      configASSERT(recvd == 4);
-      configASSERT(std::string_view(reinterpret_cast<char*>(buf), 4) == "pong");
-      xTaskNotifyGive(parent_task_);
-      delay(100);
+    if (now - pin.last_press_ < 250) {
+      // Only accept one press per 250ms
+      return;
     }
+    pin.last_press_ = now;
+    pin.handler_();
   }
 
-  TaskHandle_t parent_task_;
+  uint8_t pin_;
+  int32_t last_press_;
+  std::function<void()> handler_;
 };
 
-void setup_pingpong() {
-  auto* ping_ponger = new PingPonger;
-  Serial1.println("ping_ponger.begin");
-  ping_ponger->Begin(IPAddress(192, 168, 4, 22));
-  Serial1.println("ping_ponger active");
+SomfyRadio somfy;
+
+WiFiClient wifi_client;
+HADevice device("autoawning");
+HACover cover("awning");
+HAMqtt mqtt(wifi_client, device);
+
+QueueHandle_t command_queue;
+
+// The HACover class doesn't define My, but we need that for our chassis
+// buttons, so we have our own enum.
+enum CoverCommandOrMy {
+  CommandClose,
+  CommandOpen,
+  CommandStop,
+  CommandMy,
+};
+
+void DebouncedButtonHandler(CoverCommandOrMy c) {
+  BaseType_t higher_priority_task_woken;
+  HACover::CoverCommand command = HACover::CommandOpen;
+  xQueueSendFromISR(command_queue, &c, &higher_priority_task_woken);
+  portYIELD_FROM_ISR(higher_priority_task_woken);
 }
 
-void setup_interrupt() {
-  pinMode(15, INPUT_PULLUP);
-  attachInterrupt(15, []() { Serial1.println("Interrupted!"); }, FALLING);
-  Serial1.println("set up interrupt");
+DebouncedButton up_button(D20, [] { DebouncedButtonHandler(CommandOpen); });
+DebouncedButton my_button(D19, [] { DebouncedButtonHandler(CommandMy); });
+DebouncedButton dn_button(D18, [] { DebouncedButtonHandler(CommandClose); });
+
+void StopCover() {
+  const HACover::CoverState state = cover.getCurrentState();
+  if (state == HACover::StateStopped || state == HACover::StateOpen ||
+      state == HACover::StateClosed) {
+    return;
+  }
+
+  if (state == HACover::StateOpening) {
+    somfy.transmit(SomfyRadio::Up);
+  } else {
+    somfy.transmit(SomfyRadio::Down);
+  }
+  cover.setState(HACover::StateStopped);
 }
+
+void OpenCover() {
+  const HACover::CoverState state = cover.getCurrentState();
+  if (state == HACover::StateOpen || state == HACover::StateOpening) {
+    return;
+  }
+  if (state == HACover::StateClosing) {
+    StopCover();
+    delay(500);
+  }
+  somfy.transmit(SomfyRadio::Down);
+  cover.setState(HACover::StateOpening);
+}
+
+void CloseCover() {
+  const HACover::CoverState state = cover.getCurrentState();
+  if (state == HACover::StateClosed || state == HACover::StateClosing) {
+    return;
+  }
+  if (state == HACover::StateOpening) {
+    StopCover();
+    delay(500);
+  }
+  somfy.transmit(SomfyRadio::Up);
+  cover.setState(HACover::StateClosing);
+}
+
+void CompleteMotion() {
+  const HACover::CoverState state = cover.getCurrentState();
+  if (state == HACover::StateOpening) {
+    cover.setState(HACover::StateOpen);
+  } else if (state == HACover::StateClosing) {
+    cover.setState(HACover::StateClosed);
+  }
+}
+
+bool IsInMotion() {
+  const HACover::CoverState state = cover.getCurrentState();
+  return state == HACover::StateOpening || state == HACover::StateClosing;
+}
+
+#define STR(x) #x
+#define SSTR(x) STR(x)
 
 void setup() {
-  Serial1.begin();
-  Serial1.println("Wifi.begin");
-  WiFi.begin(STR(WIFI_SSID), STR(WIFI_PASSWORD));
-  while (!WiFi.isConnected()) {
-    delay(100);
+  delay(500);
+  WiFi.begin(SSTR(WIFI_SSID), SSTR(WIFI_PASSWORD));
+
+  command_queue = xQueueCreate(1, sizeof(HACover::CoverCommand));
+
+  device.enableExtendedUniqueIds();
+  device.enableLastWill();
+  device.enableSharedAvailability();
+  device.setName("Auto Awning");
+  cover.onCommand([](HACover::CoverCommand in, HACover* sender) {
+    CoverCommandOrMy out;
+    switch (in) {
+      case HACover::CommandStop:
+        out = CommandStop;
+        break;
+      case HACover::CommandOpen:
+        out = CommandOpen;
+        break;
+      case HACover::CommandClose:
+        out = CommandClose;
+        break;
+    }
+
+    xQueueSend(command_queue, &out, 0);
+  });
+
+  somfy.begin();
+
+  while (WiFi.isConnected()) {
+    Serial1.println("Waiting for wifi...");
+    delay(1000);
   }
-  Serial1.println("Wifi ready");
+  Serial1.println("WiFi up");
 
-  Serial1.println("Setting up test.");
-#if INTERRUPT_SECOND != 0
-  setup_pingpong();
-  setup_interrupt();
-#else
-  setup_interrupt();
-  setup_pingpong();
-#endif
-  pinMode(14, OUTPUT_4MA);
-  digitalWrite(14, HIGH);
-};
+  mqtt.begin(SSTR(MQTT_SERVER), SSTR(MQTT_USER), SSTR(MQTT_PASSWORD));
+  xTaskCreate(
+      [](void*) {
+        while (true) {
+          mqtt.loop();
+          delay(5);
+        }
+      },
+      "mqtt_loop", 2048, NULL, 1, NULL);
 
-bool on = false;
+  while (!mqtt.isConnected()) {
+    delay(1000);
+  }
+  Serial1.println("MQTT up");
+}
 
 void loop() {
-  delay(1000);
-  if (!on) {
-    Serial1.println("Sending signal that should cause interrupt . . .");
-  }
+  HACover::CoverCommand command;
+  TickType_t delay = portMAX_DELAY;
+  while (true) {
+    if (!xQueueReceive(command_queue, &command, delay)) {
+      // We timed out, which will only happen if we're in motion or a really
+      // long time passes. If there's nothing to be done, CompleteMotion() is a
+      // noop anyway.
+      CompleteMotion();
+      delay = portMAX_DELAY;
+      continue;
+    };
 
-  digitalWrite(14, on);
-  on = !on;
+    switch (command) {
+      case CommandClose:
+        CloseCover();
+        break;
+      case CommandOpen:
+        OpenCover();
+        break;
+      case CommandStop:
+        StopCover();
+        break;
+      case CommandMy:
+        // If we're in motion, then we stop. Otherwise we send the My command,
+        // which sends my and sets the state to the opposite of its current.
+        if (IsInMotion()) {
+          StopCover();
+        } else {
+          somfy.transmit(SomfyRadio::My);
+          cover.setState(cover.getCurrentState() == HACover::StateOpen
+                             ? HACover::StateClosing
+                             : HACover::StateOpening);
+        }
+    }
+
+    // After five seconds, complete whatever motion we started.
+    if (IsInMotion()) {
+      delay = pdMS_TO_TICKS(5000);
+    }
+  }
 }
